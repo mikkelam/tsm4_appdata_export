@@ -39,7 +39,11 @@ def unpack_data(data_line: str) -> tuple[int, ...]:
 
     for i in range(len(tbl_data)):
         val = tbl_data[i]
-        if len(val) > 6:
+        if val.isdigit():
+            # Handle integer values
+            val = int(val)
+        # string encoded numbers
+        elif len(val) > 6:
             # Handle long values
             val = int(val[-6:], 32) + int(val[:-6], 32) * (2**30)
         else:
@@ -64,8 +68,10 @@ def parse_tsm_appdata(path: Path) -> Generator[TSMData, None, None]:
                 # split the h
                 headers = header_str.replace('"', "").split(",")
                 data_groups = data_str[1:-1].split("},{")
-
+                
+                
                 data = [unpack_data(group) for group in data_groups]
+                print(f'headers: {headers}, data_str: {data_str[:50]} {data[0:5]}')
                 yield TSMData(
                     data_type=TSMDataType(data_type),
                     realm=realm,
