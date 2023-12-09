@@ -68,10 +68,8 @@ def parse_tsm_appdata(path: Path) -> Generator[TSMData, None, None]:
                 # split the h
                 headers = header_str.replace('"', "").split(",")
                 data_groups = data_str[1:-1].split("},{")
-                
-                
+
                 data = [unpack_data(group) for group in data_groups]
-                print(f'headers: {headers}, data_str: {data_str[:50]} {data[0:5]}')
                 yield TSMData(
                     data_type=TSMDataType(data_type),
                     realm=realm,
