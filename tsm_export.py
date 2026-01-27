@@ -1,25 +1,24 @@
 import argparse
+import enum
+import re
 from collections import defaultdict
 from dataclasses import dataclass
-import enum
 from pathlib import Path
-import re
 from typing import Generator
+
 import pandas as pd
 
 
 class TSMDataType(enum.Enum):
-    AUCTIONDB_NON_COMMODITY_HISTORICAL = 'AUCTIONDB_NON_COMMODITY_HISTORICAL'
-    AUCTIONDB_NON_COMMODITY_DATA = 'AUCTIONDB_NON_COMMODITY_DATA'
-    AUCTIONDB_NON_COMMODITY_SCAN_STAT = 'AUCTIONDB_NON_COMMODITY_SCAN_STAT'
-    AUCTIONDB_REGION_STAT = 'AUCTIONDB_REGION_STAT'
-    AUCTIONDB_REGION_HISTORICAL = 'AUCTIONDB_REGION_HISTORICAL'
-    AUCTIONDB_REGION_SALE = 'AUCTIONDB_REGION_SALE'
-    AUCTIONDB_COMMODITY_SCAN_STAT = 'AUCTIONDB_COMMODITY_SCAN_STAT'
-    AUCTIONDB_COMMODITY_DATA = 'AUCTIONDB_COMMODITY_DATA'
-    AUCTIONDB_COMMODITY_HISTORICAL = 'AUCTIONDB_COMMODITY_HISTORICAL'
-
-
+    AUCTIONDB_NON_COMMODITY_HISTORICAL = "AUCTIONDB_NON_COMMODITY_HISTORICAL"
+    AUCTIONDB_NON_COMMODITY_DATA = "AUCTIONDB_NON_COMMODITY_DATA"
+    AUCTIONDB_NON_COMMODITY_SCAN_STAT = "AUCTIONDB_NON_COMMODITY_SCAN_STAT"
+    AUCTIONDB_REGION_STAT = "AUCTIONDB_REGION_STAT"
+    AUCTIONDB_REGION_HISTORICAL = "AUCTIONDB_REGION_HISTORICAL"
+    AUCTIONDB_REGION_SALE = "AUCTIONDB_REGION_SALE"
+    AUCTIONDB_COMMODITY_SCAN_STAT = "AUCTIONDB_COMMODITY_SCAN_STAT"
+    AUCTIONDB_COMMODITY_DATA = "AUCTIONDB_COMMODITY_DATA"
+    AUCTIONDB_COMMODITY_HISTORICAL = "AUCTIONDB_COMMODITY_HISTORICAL"
 
     def is_region_data(self) -> bool:
         return self in (
@@ -39,56 +38,95 @@ class TSMData:
 
 
 def unpack_data(data_line: str) -> tuple[int, ...]:
-    # Split the data string into an array and process each value
-    tbl_data = data_line.split(",")
+    # More defensive decoding: tolerate stray punctuation / unexpected tokens.
+    raw_tokens = data_line.split(",")
+    out: list[int] = []
 
-    for i in range(len(tbl_data)):
-        val = tbl_data[i]
-        if val.isdigit():
-            # Handle integer values
-            val = int(val)
-        # string encoded numbers
-        elif len(val) > 6:
-            # Handle long values
-            val = int(val[-6:], 32) + int(val[:-6], 32) * (2**30)
-        else:
-            val = int(val, 32)
-        tbl_data[i] = val
+    for tok in raw_tokens:
+        tok = tok.strip().strip('"').upper()
+        if not tok:
+            out.append(0)
+            continue
 
-    return tbl_data
+        # Fast path pure digits
+        if tok.isdigit():
+            out.append(int(tok))
+            continue
+
+        # Remove any non base32 characters (0-9 A-V) – TSM encoding uses base32 set.
+        allowed = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+        cleaned = "".join(ch for ch in tok if ch in allowed)
+
+        if not cleaned:
+            out.append(0)
+            continue
+
+        try:
+            if len(cleaned) > 6:
+                val = int(cleaned[-6:], 32) + int(cleaned[:-6], 32) * (2**30)
+            else:
+                val = int(cleaned, 32)
+        except ValueError:
+            val = 0
+        out.append(val)
+
+    return tuple(out)
 
 
 def parse_tsm_appdata(path: Path) -> Generator[TSMData, None, None]:
-    pattern = r'LoadData\("([^"]+)",\s*"([^"]+)",.*\{downloadTime=(\d+),fields=\{([^}]+)\},data=\{(.+)}\}\]\]'
-    with open(path, "r") as file:
-        for idx, line in enumerate(file):
-            match = re.search(pattern, line)
-            if match:
-                data_type = match.group(1)
-                realm = match.group(2)
-                download_time = int(match.group(3))
-                header_str = match.group(4)
-                data_str = match.group(5)
+    """
+    Parse the TSM AppData.lua file.
 
-                # split the h
-                headers = header_str.replace('"', "").split(",")
-                data_groups = data_str[1:-1].split("},{")
+    The old implementation assumed each LoadData call was on a single line.
+    In modern TSM (and in large datasets), each LoadData block can span multiple lines.
+    This version:
+      - Reads the entire file at once
+      - Uses a DOTALL regex to capture multi-line data blocks
+      - Extracts dataset metadata and decodes the compact base32-style numeric fields
+    """
+    text = path.read_text()
 
-                data = [unpack_data(group) for group in data_groups]
-                yield TSMData(
-                    data_type=TSMDataType(data_type),
-                    realm=realm,
-                    download_time=download_time,
-                    headers=headers,
-                    data=data,
-                )
+    # Example block prefix:
+    # select(2, ...).LoadData("AUCTIONDB_NON_COMMODITY_DATA","Gehennas-Horde",[[return {downloadTime=1758316736,fields={"itemString","minBuyout","numAuctions","marketValueRecent"},data={{82211,1E2JF,2,1E2JF},{...}}}]])
+    pattern = re.compile(
+        r'select\(2,\s*\.\.\.\)\.LoadData\("([^"]+)"\s*,\s*"([^"]+)"\s*,\s*\[\[return {downloadTime=(\d+),fields=\{([^}]*)\},data=\{(.*?)\}\}\]\]',
+        re.DOTALL,
+    )
 
-            else:
-                if "APP_INFO" in line:
-                    # ignore the app info lines
-                    pass
-                else:
-                    print(f"No match for line {idx}: {line:.50}")
+    for match in pattern.finditer(text):
+        data_type = match.group(1)
+        realm = match.group(2)
+        download_time = int(match.group(3))
+        header_str = match.group(4)
+        data_str = match.group(5).strip()
+
+        headers = [h.strip('"') for h in header_str.split(",") if h]
+
+        # data_str looks like: {{row1},{row2},...}
+        if data_str.startswith("{") and data_str.endswith("}"):
+            inner = data_str[1:-1].strip()
+        else:
+            inner = data_str
+
+        if not inner:
+            rows = []
+        else:
+            # Split on '},{' boundaries between rows (rows themselves are simple lists).
+            raw_rows = re.split(r"\},\{", inner)
+            rows = []
+            for r in raw_rows:
+                r_clean = r.strip().lstrip("{").rstrip("}")
+                if not r_clean:
+                    continue
+                rows.append(unpack_data(r_clean))
+
+        yield TSMData(
+            data_type=TSMDataType(data_type),
+            realm=realm,
+            download_time=download_time,
+            headers=headers,
+            data=rows,
+        )
 
 
 def join_data(data: list[TSMData], join_col: str = "itemString") -> pd.DataFrame:
